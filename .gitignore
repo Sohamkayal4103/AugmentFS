@@ -1,0 +1,8 @@
+metadatafs
+*.o
+*.d
+mount_point/
+.vscode/
+.DS_Store
+Thumbs.db
+*~
