@@ -18,11 +18,9 @@ This initial version of a custom filesystem. It successfully:
 - Linux (e.g., Ubuntu)
 
 - g++ (C++17)
-
-```
-make
-```
-
+  
+- make
+  
 - libfuse-dev (or fuse on some systems)
 
 - pkg-config
