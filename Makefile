@@ -33,11 +33,14 @@ clean:
 # Rule to run (for easy testing)
 # We don't need a 'source_dir' for this simple task
 run: all
-	@echo "--- Setting up mount directory ---"
+	@echo "--- Setting up directories ---"
+	@mkdir -p ./backing_dir
 	@mkdir -p ./mount_point
 	@echo "--- Running filesystem (in foreground) ---"
+	@echo "Backing dir: ./backing_dir"
+	@echo "Mount point: ./mount_point"
 	@echo "--- Open another terminal to test ---"
-	./$(TARGET) -f ./mount_point
+	./$(TARGET) ./backing_dir ./mount_point -f
 
 # Rule to unmount
 unmount:
