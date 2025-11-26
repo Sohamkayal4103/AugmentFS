@@ -11,7 +11,10 @@
 #include <dirent.h>
 #include <fcntl.h>
 #include <unistd.h>
+#include <sqlite3.h>
+#include <vector> 
 
+static sqlite3* meta_db = nullptr;
 static std::string backing_root;
 
 // Join backing_root + FUSE path (e.g. "/foo.txt")
@@ -25,6 +28,113 @@ static std::string full_path(const char* path) {
 
     result += path;  // FUSE paths always start with '/'
     return result;
+}
+
+static int fs_init_db() {
+    std::string db_path = full_path("/.metadata.db");  // lives in backing_root
+    std::cout << "Opening metadata DB at: " << db_path << std::endl;
+
+    int rc = sqlite3_open(db_path.c_str(), &meta_db);
+    if (rc != SQLITE_OK) {
+        std::cerr << "sqlite3_open failed: " << sqlite3_errmsg(meta_db) << std::endl;
+        return -1;
+    }
+
+    const char* sql =
+        "CREATE TABLE IF NOT EXISTS metadata ("
+        "  path TEXT NOT NULL,"
+        "  key  TEXT NOT NULL,"
+        "  value BLOB,"
+        "  PRIMARY KEY(path, key)"
+        ");"
+        "CREATE TABLE IF NOT EXISTS checksums ("
+        "  path TEXT PRIMARY KEY,"
+        "  checksum TEXT"
+        ");";
+
+    char* errmsg = nullptr;
+    rc = sqlite3_exec(meta_db, sql, nullptr, nullptr, &errmsg);
+    if (rc != SQLITE_OK) {
+        std::cerr << "sqlite3_exec failed: " << errmsg << std::endl;
+        sqlite3_free(errmsg);
+        return -1;
+    }
+
+    return 0;
+}
+
+static void* fs_init(struct fuse_conn_info* conn) {
+    (void) conn;
+    if (fs_init_db() != 0) {
+        std::cerr << "Failed to init metadata DB" << std::endl;
+    }
+    return nullptr;
+}
+
+static void fs_destroy(void* private_data) {
+    (void) private_data;
+    if (meta_db) {
+        std::cout << "Closing metadata DB" << std::endl;
+        sqlite3_close(meta_db);
+        meta_db = nullptr;
+    }
+}
+
+static int fs_listxattr(const char* path, char* list, size_t size) {
+    if (!meta_db) return -EIO;
+
+    std::cout << "fs_listxattr: " << path << std::endl;
+
+    const char* sql = "SELECT key FROM metadata WHERE path = ?;";
+    sqlite3_stmt* stmt = nullptr;
+
+    int rc = sqlite3_prepare_v2(meta_db, sql, -1, &stmt, nullptr);
+    if (rc != SQLITE_OK) {
+        std::cerr << "fs_listxattr: prepare failed: "
+                  << sqlite3_errmsg(meta_db) << std::endl;
+        return -EIO;
+    }
+
+    sqlite3_bind_text(stmt, 1, path, -1, SQLITE_TRANSIENT);
+
+    // First pass: collect keys and compute required buffer size
+    std::vector<std::string> keys;
+    size_t required = 0;
+
+    while ((rc = sqlite3_step(stmt)) == SQLITE_ROW) {
+        const unsigned char* key = sqlite3_column_text(stmt, 0);
+        if (!key) continue;
+
+        std::string k(reinterpret_cast<const char*>(key));
+        required += k.size() + 1;   // +1 for '\0'
+        keys.push_back(std::move(k));
+    }
+
+    sqlite3_finalize(stmt);
+
+    if (rc != SQLITE_DONE) {
+        std::cerr << "fs_listxattr: step failed\n";
+        return -EIO;
+    }
+
+    // If caller only wants size
+    if (list == nullptr || size == 0) {
+        return (int)required;
+    }
+
+    if (size < required) {
+        return -ERANGE;
+    }
+
+    // Second pass: pack keys separated by '\0'
+    char* p = list;
+    for (const auto& k : keys) {
+        memcpy(p, k.c_str(), k.size());
+        p += k.size();
+        *p++ = '\0';
+    }
+
+    return (int)required;
 }
 
 /*
@@ -165,7 +275,102 @@ static int fs_unlink(const char* path) {
     if (unlink(real.c_str()) == -1) {
         return -errno;
     }
+
+    if (meta_db) {
+        const char* sql1 = "DELETE FROM metadata WHERE path = ?;";
+        const char* sql2 = "DELETE FROM checksums WHERE path = ?;";
+
+        sqlite3_stmt* stmt = nullptr;
+
+        if (sqlite3_prepare_v2(meta_db, sql1, -1, &stmt, nullptr) == SQLITE_OK) {
+            sqlite3_bind_text(stmt, 1, path, -1, SQLITE_TRANSIENT);
+            sqlite3_step(stmt);
+            sqlite3_finalize(stmt);
+        }
+
+        if (sqlite3_prepare_v2(meta_db, sql2, -1, &stmt, nullptr) == SQLITE_OK) {
+            sqlite3_bind_text(stmt, 1, path, -1, SQLITE_TRANSIENT);
+            sqlite3_step(stmt);
+            sqlite3_finalize(stmt);
+        }
+    }
     return 0;
+}
+
+
+static int fs_setxattr(const char* path, const char* name,
+                       const char* value, size_t size, int flags) {
+    (void) flags;
+
+    if (!meta_db) return -EIO;
+
+    std::cout << "fs_setxattr: " << path << " [" << name << "]" << std::endl;
+
+    const char* sql =
+        "INSERT INTO metadata(path, key, value) "
+        "VALUES(?, ?, ?) "
+        "ON CONFLICT(path, key) DO UPDATE SET value = excluded.value;";
+
+    sqlite3_stmt* stmt = nullptr;
+    int rc = sqlite3_prepare_v2(meta_db, sql, -1, &stmt, nullptr);
+    if (rc != SQLITE_OK) {
+        return -EIO;
+    }
+
+    sqlite3_bind_text (stmt, 1, path, -1, SQLITE_TRANSIENT);
+    sqlite3_bind_text (stmt, 2, name, -1, SQLITE_TRANSIENT);
+    sqlite3_bind_blob (stmt, 3, value, (int)size, SQLITE_TRANSIENT);
+
+    rc = sqlite3_step(stmt);
+    sqlite3_finalize(stmt);
+
+    if (rc != SQLITE_DONE) {
+        return -EIO;
+    }
+    return 0;
+}
+
+static int fs_getxattr(const char* path, const char* name,
+                       char* value, size_t size) {
+    if (!meta_db) return -EIO;
+
+    std::cout << "fs_getxattr: " << path << " [" << name << "]" << std::endl;
+
+    const char* sql =
+        "SELECT value FROM metadata WHERE path = ? AND key = ?;";
+
+    sqlite3_stmt* stmt = nullptr;
+    int rc = sqlite3_prepare_v2(meta_db, sql, -1, &stmt, nullptr);
+    if (rc != SQLITE_OK) {
+        return -EIO;
+    }
+
+    sqlite3_bind_text(stmt, 1, path, -1, SQLITE_TRANSIENT);
+    sqlite3_bind_text(stmt, 2, name, -1, SQLITE_TRANSIENT);
+
+    rc = sqlite3_step(stmt);
+    if (rc != SQLITE_ROW) {
+        sqlite3_finalize(stmt);
+        return -ENODATA;   // xattr not found
+    }
+
+    const void* blob = sqlite3_column_blob(stmt, 0);
+    int blob_size    = sqlite3_column_bytes(stmt, 0);
+
+    // First, caller may ask for size only (value == nullptr)
+    if (value == nullptr || size == 0) {
+        sqlite3_finalize(stmt);
+        return blob_size;
+    }
+
+    if (size < (size_t)blob_size) {
+        sqlite3_finalize(stmt);
+        return -ERANGE;    // buffer too small
+    }
+
+    memcpy(value, blob, blob_size);
+    sqlite3_finalize(stmt);
+    return blob_size;      // number of bytes copied
 }
 
 
@@ -173,7 +378,10 @@ static int fs_unlink(const char* path) {
 static struct fuse_operations fs_ops;
 
 void set_fs_ops() {
-    fs_ops = {}; // Initialize to all zeros
+    fs_ops = {};  // Initialize to all zeros
+
+    fs_ops.init     = fs_init;
+    fs_ops.destroy  = fs_destroy;
 
     fs_ops.getattr  = fs_getattr;
     fs_ops.readdir  = fs_readdir;
@@ -185,6 +393,11 @@ void set_fs_ops() {
 
     fs_ops.create   = fs_create;
     fs_ops.unlink   = fs_unlink;
+
+    fs_ops.setxattr = fs_setxattr;
+    fs_ops.getxattr = fs_getxattr;
+    fs_ops.setxattr = fs_setxattr;
+    fs_ops.listxattr = fs_listxattr;
 }
 
 

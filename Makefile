@@ -1,4 +1,4 @@
-# Makefile for Metadata-Augmenting FUSE File System (Task 1)
+# Makefile for Metadata-Augmenting FUSE File System
 
 # Compiler
 CXX = g++
@@ -10,8 +10,7 @@ CXX = g++
 CXXFLAGS = -std=c++17 -g $(shell pkg-config fuse --cflags)
 
 # Linker flags
-# We only need the FUSE library for this task
-LDFLAGS = $(shell pkg-config fuse --libs)
+LDFLAGS  = $(shell pkg-config fuse --libs) -lsqlite3
 
 # Target executable name (the final program)
 TARGET = metadatafs
