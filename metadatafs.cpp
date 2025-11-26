@@ -13,9 +13,64 @@
 #include <unistd.h>
 #include <sqlite3.h>
 #include <vector> 
+#include <unordered_map>
+#include <sstream>
+#include <cstdint>
 
 static sqlite3* meta_db = nullptr;
 static std::string backing_root;
+
+static std::unordered_map<int, uint64_t> checksum_map; // fd -> running hash
+// FNV-1a 64-bit constants
+static const uint64_t FNV_OFFSET_BASIS = 1469598103934665603ULL;
+static const uint64_t FNV_PRIME        = 1099511628211ULL;
+
+// Update running FNV-1a hash with a buffer
+static void update_fnv1a(uint64_t &hash, const char* buf, size_t size) {
+    const unsigned char* p = reinterpret_cast<const unsigned char*>(buf);
+    for (size_t i = 0; i < size; ++i) {
+        hash ^= static_cast<uint64_t>(p[i]);
+        hash *= FNV_PRIME;
+    }
+}
+
+// Store/overwrite checksum(path) in the checksums table
+static int store_checksum(const char* path, uint64_t hash) {
+    if (!meta_db) return -EIO;
+
+    // convert hash to hex string
+    std::ostringstream oss;
+    oss << std::hex << hash;
+    std::string checksum = oss.str();
+
+    const char* sql =
+        "INSERT INTO checksums(path, checksum) "
+        "VALUES(?, ?) "
+        "ON CONFLICT(path) DO UPDATE SET checksum = excluded.checksum;";
+
+    sqlite3_stmt* stmt = nullptr;
+    int rc = sqlite3_prepare_v2(meta_db, sql, -1, &stmt, nullptr);
+    if (rc != SQLITE_OK) {
+        std::cerr << "store_checksum: prepare failed: "
+                  << sqlite3_errmsg(meta_db) << std::endl;
+        return -EIO;
+    }
+
+    sqlite3_bind_text(stmt, 1, path, -1, SQLITE_TRANSIENT);
+    sqlite3_bind_text(stmt, 2, checksum.c_str(), -1, SQLITE_TRANSIENT);
+
+    rc = sqlite3_step(stmt);
+    sqlite3_finalize(stmt);
+
+    if (rc != SQLITE_DONE) {
+        std::cerr << "store_checksum: step failed for " << path << std::endl;
+        return -EIO;
+    }
+
+    std::cout << "Stored checksum for " << path << ": " << checksum << std::endl;
+    return 0;
+}
+
 
 // Join backing_root + FUSE path (e.g. "/foo.txt")
 static std::string full_path(const char* path) {
@@ -202,7 +257,16 @@ static int fs_open(const char* path, struct fuse_file_info* fi) {
         return -errno;
     }
 
-    fi->fh = fd;  // store OS file descriptor in FUSE's file handle
+    fi->fh = fd;    // store OS file descriptor in FUSE's file handle
+
+    // Determine access mode
+    int accmode = fi->flags & O_ACCMODE;
+    bool is_writer = (accmode == O_WRONLY || accmode == O_RDWR);
+
+    if (is_writer) {
+        checksum_map[fd] = FNV_OFFSET_BASIS;  // initialize running hash
+    }
+
     return 0;
 }
 
@@ -229,24 +293,43 @@ static int fs_write(const char* path, const char* buf, size_t size,
     (void) path;
 
     int fd = static_cast<int>(fi->fh);
+
+    // Update checksum if this fd is tracked
+    auto it = checksum_map.find(fd);
+    if (it != checksum_map.end()) {
+        update_fnv1a(it->second, buf, size);
+    }
+
     ssize_t res = pwrite(fd, buf, size, offset);
     if (res == -1) {
         return -errno;
     }
-    return res;   // number of bytes written
+    return res;
 }
 
 /*
  * fs_release: close the file when FUSE is done
  */
 static int fs_release(const char* path, struct fuse_file_info* fi) {
-    (void) path;
-
     int fd = static_cast<int>(fi->fh);
-    if (close(fd) == -1) {
-        return -errno;
+
+    // Close underlying file
+    int res = (close(fd) == -1) ? -errno : 0;
+
+    // If we tracked a checksum for this fd, finalize & store it
+    auto it = checksum_map.find(fd);
+    if (it != checksum_map.end()) {
+        uint64_t hash = it->second;
+        checksum_map.erase(it);
+
+        int rc = store_checksum(path, hash);
+        if (rc != 0) {
+            std::cerr << "fs_release: failed to store checksum for "
+                      << path << std::endl;
+        }
     }
-    return 0;
+
+    return res;
 }
 
 /*
@@ -262,6 +345,14 @@ static int fs_create(const char* path, mode_t mode, struct fuse_file_info* fi) {
     }
 
     fi->fh = fd;
+
+    int accmode = fi->flags & O_ACCMODE;
+    bool is_writer = (accmode == O_WRONLY || accmode == O_RDWR);
+
+    if (is_writer) {
+        checksum_map[fd] = FNV_OFFSET_BASIS;
+    }
+
     return 0;
 }
 
@@ -399,7 +490,6 @@ void set_fs_ops() {
     fs_ops.setxattr = fs_setxattr;
     fs_ops.listxattr = fs_listxattr;
 }
-
 
 int main(int argc, char* argv[]) {
     // We expect: ./metadatafs <backing_dir> <mount_point> [FUSE options...]
