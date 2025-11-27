@@ -14,6 +14,7 @@
 #include <sqlite3.h>
 #include <vector> 
 #include <unordered_map>
+#include <unordered_set>
 #include <sstream>
 #include <cstdint>
 
@@ -24,6 +25,10 @@ static std::unordered_map<int, uint64_t> checksum_map; // fd -> running hash
 // FNV-1a 64-bit constants
 static const uint64_t FNV_OFFSET_BASIS = 1469598103934665603ULL;
 static const uint64_t FNV_PRIME        = 1099511628211ULL;
+
+// For read-time verification
+static std::unordered_set<int> verified_ok_fds;    // fds whose checksum matched
+static std::unordered_set<int> verified_bad_fds;   // fds with checksum mismatch
 
 // Update running FNV-1a hash with a buffer
 static void update_fnv1a(uint64_t &hash, const char* buf, size_t size) {
@@ -71,7 +76,6 @@ static int store_checksum(const char* path, uint64_t hash) {
     return 0;
 }
 
-
 // Join backing_root + FUSE path (e.g. "/foo.txt")
 static std::string full_path(const char* path) {
     std::string result = backing_root;
@@ -83,6 +87,112 @@ static std::string full_path(const char* path) {
 
     result += path;  // FUSE paths always start with '/'
     return result;
+}
+
+// Compute FNV-1a checksum of the entire file at real_path (used for reads)
+static std::string compute_checksum_for_file(const std::string& real_path) {
+    int fd = open(real_path.c_str(), O_RDONLY);
+    if (fd == -1) {
+        std::cerr << "compute_checksum_for_file: failed to open "
+                  << real_path << std::endl;
+        return "";
+    }
+
+    uint64_t hash = FNV_OFFSET_BASIS;
+    char buf[4096];
+    ssize_t n;
+
+    while ((n = read(fd, buf, sizeof(buf))) > 0) {
+        update_fnv1a(hash, buf, (size_t)n);
+    }
+
+    if (n == -1) {
+        std::cerr << "compute_checksum_for_file: read error on "
+                  << real_path << std::endl;
+        close(fd);
+        return "";
+    }
+
+    close(fd);
+
+    std::ostringstream oss;
+    oss << std::hex << hash;
+    return oss.str();
+}
+
+// Verify checksum for (path, fd) once. Cache result in verified_*_fds.
+static bool verify_fd_checksum(const char* path, int fd) {
+    // If we've already verified or rejected this fd, just return cached result.
+    if (verified_ok_fds.count(fd)) {
+        return true;
+    }
+    if (verified_bad_fds.count(fd)) {
+        return false;
+    }
+
+    if (!meta_db) {
+        // No DB means no integrity info; allow read.
+        verified_ok_fds.insert(fd);
+        return true;
+    }
+
+    // 1. Look up stored checksum from DB
+    const char* sql = "SELECT checksum FROM checksums WHERE path = ?;";
+    sqlite3_stmt* stmt = nullptr;
+    int rc = sqlite3_prepare_v2(meta_db, sql, -1, &stmt, nullptr);
+    if (rc != SQLITE_OK) {
+        std::cerr << "verify_fd_checksum: prepare failed: "
+                  << sqlite3_errmsg(meta_db) << std::endl;
+        verified_ok_fds.insert(fd);  // fail-open
+        return true;
+    }
+
+    sqlite3_bind_text(stmt, 1, path, -1, SQLITE_TRANSIENT);
+    rc = sqlite3_step(stmt);
+
+    if (rc != SQLITE_ROW) {
+        // No stored checksum for this path -> treat as unprotected, allow read.
+        sqlite3_finalize(stmt);
+        verified_ok_fds.insert(fd);
+        return true;
+    }
+
+    const unsigned char* checksum_text = sqlite3_column_text(stmt, 0);
+    std::string stored_checksum =
+        checksum_text ? reinterpret_cast<const char*>(checksum_text) : "";
+
+    sqlite3_finalize(stmt);
+
+    if (stored_checksum.empty()) {
+        // Weird, but fail-open
+        verified_ok_fds.insert(fd);
+        return true;
+    }
+
+    // 2. Compute current checksum from the backing file
+    std::string real = full_path(path);
+    std::string current = compute_checksum_for_file(real);
+
+    if (current.empty()) {
+        // Could not compute; conservative choice: treat as bad
+        std::cerr << "verify_fd_checksum: empty current checksum for "
+                  << path << std::endl;
+        verified_bad_fds.insert(fd);
+        return false;
+    }
+
+    if (current == stored_checksum) {
+        std::cout << "verify_fd_checksum: OK for " << path
+                  << " (checksum " << current << ")\n";
+        verified_ok_fds.insert(fd);
+        return true;
+    } else {
+        std::cerr << "verify_fd_checksum: MISMATCH for " << path
+                  << " stored=" << stored_checksum
+                  << " current=" << current << std::endl;
+        verified_bad_fds.insert(fd);
+        return false;
+    }
 }
 
 static int fs_init_db() {
@@ -259,6 +369,10 @@ static int fs_open(const char* path, struct fuse_file_info* fi) {
 
     fi->fh = fd;    // store OS file descriptor in FUSE's file handle
 
+    // Clear any stale read verification state for this fd
+    verified_ok_fds.erase(fd);
+    verified_bad_fds.erase(fd);
+
     // Determine access mode
     int accmode = fi->flags & O_ACCMODE;
     bool is_writer = (accmode == O_WRONLY || accmode == O_RDWR);
@@ -275,15 +389,22 @@ static int fs_open(const char* path, struct fuse_file_info* fi) {
  */
 static int fs_read(const char* path, char* buf, size_t size,
                    off_t offset, struct fuse_file_info* fi) {
-    (void) path;  // unused because we already have fd
-
     int fd = static_cast<int>(fi->fh);
+
+    // If this fd is NOT being tracked as a writer, enforce checksum verification
+    if (checksum_map.find(fd) == checksum_map.end()) {
+        if (!verify_fd_checksum(path, fd)) {
+            return -EIO;
+        }
+    }
+
     ssize_t res = pread(fd, buf, size, offset);
     if (res == -1) {
         return -errno;
     }
-    return res;   // number of bytes read
+    return res;
 }
+
 
 /*
  * fs_write: write to an already-open file
@@ -328,6 +449,9 @@ static int fs_release(const char* path, struct fuse_file_info* fi) {
                       << path << std::endl;
         }
     }
+
+    verified_ok_fds.erase(fd);
+    verified_bad_fds.erase(fd);
 
     return res;
 }
@@ -464,6 +588,46 @@ static int fs_getxattr(const char* path, const char* name,
     return blob_size;      // number of bytes copied
 }
 
+static int fs_rename(const char* from, const char* to) {
+    std::string real_from = full_path(from);
+    std::string real_to   = full_path(to);
+
+    std::cout << "fs_rename: " << from << " -> " << to
+              << "  (" << real_from << " -> " << real_to << ")\n";
+
+    if (::rename(real_from.c_str(), real_to.c_str()) == -1) {
+        return -errno;
+    }
+
+    if (meta_db) {
+        // Update metadata table
+        const char* sql_meta =
+            "UPDATE metadata SET path = ? WHERE path = ?;";
+        sqlite3_stmt* stmt = nullptr;
+
+        if (sqlite3_prepare_v2(meta_db, sql_meta, -1, &stmt, nullptr) == SQLITE_OK) {
+            sqlite3_bind_text(stmt, 1, to,   -1, SQLITE_TRANSIENT);
+            sqlite3_bind_text(stmt, 2, from, -1, SQLITE_TRANSIENT);
+            sqlite3_step(stmt);
+            sqlite3_finalize(stmt);
+        }
+
+        // Update checksums table
+        const char* sql_chk =
+            "UPDATE checksums SET path = ? WHERE path = ?;";
+
+        if (sqlite3_prepare_v2(meta_db, sql_chk, -1, &stmt, nullptr) == SQLITE_OK) {
+            sqlite3_bind_text(stmt, 1, to,   -1, SQLITE_TRANSIENT);
+            sqlite3_bind_text(stmt, 2, from, -1, SQLITE_TRANSIENT);
+            sqlite3_step(stmt);
+            sqlite3_finalize(stmt);
+        }
+    }
+
+    return 0;
+}
+
+
 
 // --- FUSE Operations Struct ---
 static struct fuse_operations fs_ops;
@@ -489,6 +653,8 @@ void set_fs_ops() {
     fs_ops.getxattr = fs_getxattr;
     fs_ops.setxattr = fs_setxattr;
     fs_ops.listxattr = fs_listxattr;
+
+    fs_ops.rename = fs_rename;
 }
 
 int main(int argc, char* argv[]) {
