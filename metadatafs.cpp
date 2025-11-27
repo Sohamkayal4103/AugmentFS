@@ -17,6 +17,7 @@
 #include <unordered_set>
 #include <sstream>
 #include <cstdint>
+#include <cstring>
 
 static sqlite3* meta_db = nullptr;
 static std::string backing_root;
@@ -29,6 +30,9 @@ static const uint64_t FNV_PRIME        = 1099511628211ULL;
 // For read-time verification
 static std::unordered_set<int> verified_ok_fds;    // fds whose checksum matched
 static std::unordered_set<int> verified_bad_fds;   // fds with checksum mismatch
+static std::vector<std::string> append_only_dirs;  // e.g., "/logs", "/backups"
+
+static bool is_append_only_path(const char* path);
 
 // Update running FNV-1a hash with a buffer
 static void update_fnv1a(uint64_t &hash, const char* buf, size_t size) {
@@ -359,6 +363,12 @@ static int fs_readdir(const char* path, void* buf, fuse_fill_dir_t filler,
  * fs_open: open a file in the backing directory
  */
 static int fs_open(const char* path, struct fuse_file_info* fi) {
+    // Block O_TRUNC on append-only paths
+    if (is_append_only_path(path) && (fi->flags & O_TRUNC)) {
+        std::cout << "fs_open: DENY O_TRUNC (append-only) " << path << std::endl;
+        return -EPERM;
+    }
+
     std::string real = full_path(path);
     std::cout << "fs_open: " << path << " -> " << real << std::endl;
 
@@ -480,10 +490,33 @@ static int fs_create(const char* path, mode_t mode, struct fuse_file_info* fi) {
     return 0;
 }
 
+// Return true if path is inside any append-only directory
+static bool is_append_only_path(const char* path) {
+    if (append_only_dirs.empty()) return false;
+
+    std::string p(path);  // e.g., "/logs/foo.txt"
+
+    for (const auto& dir : append_only_dirs) {
+        // dir is like "/logs"
+        if (p == dir) return true;
+        if (p.size() > dir.size() &&
+            p.compare(0, dir.size(), dir) == 0 &&
+            p[dir.size()] == '/') {
+            return true;
+        }
+    }
+    return false;
+}
+
 /*
  * fs_unlink: delete a file
  */
 static int fs_unlink(const char* path) {
+    if (is_append_only_path(path)) {
+        std::cout << "fs_unlink: DENY (append-only) " << path << std::endl;
+        return -EPERM;
+    }
+
     std::string real = full_path(path);
     std::cout << "fs_unlink: " << path << " -> " << real << std::endl;
 
@@ -508,6 +541,22 @@ static int fs_unlink(const char* path) {
             sqlite3_step(stmt);
             sqlite3_finalize(stmt);
         }
+    }
+    return 0;
+}
+
+static int fs_truncate(const char* path, off_t size) {
+    if (is_append_only_path(path)) {
+        std::cout << "fs_truncate: DENY (append-only) " << path << std::endl;
+        return -EPERM;
+    }
+
+    std::string real = full_path(path);
+    std::cout << "fs_truncate: " << path << " -> " << real
+              << " size=" << size << std::endl;
+
+    if (truncate(real.c_str(), size) == -1) {
+        return -errno;
     }
     return 0;
 }
@@ -589,6 +638,13 @@ static int fs_getxattr(const char* path, const char* name,
 }
 
 static int fs_rename(const char* from, const char* to) {
+    // If either source or destination lives under an append-only dir, block.
+    if (is_append_only_path(from) || is_append_only_path(to)) {
+        std::cout << "fs_rename: DENY (append-only) from=" << from
+                  << " to=" << to << std::endl;
+        return -EPERM;
+    }
+
     std::string real_from = full_path(from);
     std::string real_to   = full_path(to);
 
@@ -627,6 +683,100 @@ static int fs_rename(const char* from, const char* to) {
     return 0;
 }
 
+static void add_append_only_dirs_from_csv(const char* csv) {
+    if (!csv) return;
+    std::stringstream ss(csv);
+    std::string item;
+
+    while (std::getline(ss, item, ',')) {
+        if (item.empty()) continue;
+        // no fancy trimming; assume clean names like "logs" or "backups"
+        if (item[0] != '/') {
+            item = "/" + item;  // make it absolute from FS root
+        }
+        append_only_dirs.push_back(item);
+        std::cout << "Append-only dir configured: " << item << std::endl;
+    }
+}
+
+// Scan argv (starting at index 2: after backing_root) for append_only_dirs=...
+// and remove that option from argv so FUSE doesn't see it.
+static void parse_append_only_option(int& argc, char* argv[]) {
+    // We assume:
+    // argv[0] = prog
+    // argv[1] = backing_root
+    // argv[2] = mount_point or FUSE arg
+    int i = 2;
+    while (i < argc) {
+        // Case 1: "-o", "append_only_dirs=logs,backups"
+        if (strcmp(argv[i], "-o") == 0 && i + 1 < argc) {
+            const char* opt = argv[i + 1];
+            const char* key = "append_only_dirs=";
+            const char* pos = strstr(opt, key);
+            if (pos == opt) {
+                const char* csv = opt + strlen(key);
+                add_append_only_dirs_from_csv(csv);
+
+                // Remove opt (argv[i+1])
+                for (int j = i + 1; j < argc - 1; ++j) {
+                    argv[j] = argv[j + 1];
+                }
+                --argc;
+
+                // Remove "-o" (argv[i])
+                for (int j = i; j < argc - 1; ++j) {
+                    argv[j] = argv[j + 1];
+                }
+                --argc;
+
+                // Don't advance i; new arg now sits at position i
+                continue;
+            }
+        }
+
+        // Case 2: "-oappend_only_dirs=logs,backups"
+        const char* key2 = "-oappend_only_dirs=";
+        if (strncmp(argv[i], key2, strlen(key2)) == 0) {
+            const char* csv = argv[i] + strlen(key2);
+            add_append_only_dirs_from_csv(csv);
+
+            // Remove this single argv[i]
+            for (int j = i; j < argc - 1; ++j) {
+                argv[j] = argv[j + 1];
+            }
+            --argc;
+            continue;
+        }
+
+        ++i;
+    }
+}
+
+/*
+ * fs_mkdir: create a directory in the backing store
+ */
+static int fs_mkdir(const char* path, mode_t mode) {
+    std::string real = full_path(path);
+    std::cout << "fs_mkdir: " << path << " -> " << real << std::endl;
+
+    if (mkdir(real.c_str(), mode) == -1) {
+        return -errno;
+    }
+    return 0;
+}
+
+/*
+ * fs_rmdir: remove a directory
+ */
+static int fs_rmdir(const char* path) {
+    std::string real = full_path(path);
+    std::cout << "fs_rmdir: " << path << " -> " << real << std::endl;
+
+    if (rmdir(real.c_str()) == -1) {
+        return -errno;
+    }
+    return 0;
+}
 
 
 // --- FUSE Operations Struct ---
@@ -651,10 +801,13 @@ void set_fs_ops() {
 
     fs_ops.setxattr = fs_setxattr;
     fs_ops.getxattr = fs_getxattr;
-    fs_ops.setxattr = fs_setxattr;
     fs_ops.listxattr = fs_listxattr;
 
     fs_ops.rename = fs_rename;
+    fs_ops.truncate = fs_truncate;
+
+    fs_ops.mkdir    = fs_mkdir;
+    fs_ops.rmdir    = fs_rmdir;
 }
 
 int main(int argc, char* argv[]) {
@@ -667,17 +820,24 @@ int main(int argc, char* argv[]) {
 
     backing_root = argv[1];
 
+    // Parse and strip our custom append-only option
+    parse_append_only_option(argc, argv);
+    // After this, backing_root is still argv[1], but the -o append_only_dirs=... args are gone.
+
     // Shift args left so FUSE sees: prog <mount_point> [options...]
     for (int i = 1; i < argc - 1; ++i) {
         argv[i] = argv[i + 1];
     }
-    argc--;
+    --argc;
 
     set_fs_ops();
 
     std::cout << "=========================================\n";
     std::cout << "MetadataFS (Task 1) Mounting...\n";
     std::cout << "Backing directory: " << backing_root << "\n";
+    if (!append_only_dirs.empty()) {
+        std::cout << "Append-only dirs enabled.\n";
+    }
     std::cout << "=========================================\n";
 
     int fuse_ret = fuse_main(argc, argv, &fs_ops, NULL);
@@ -685,3 +845,4 @@ int main(int argc, char* argv[]) {
     std::cout << "Unmounted filesystem.\n";
     return fuse_ret;
 }
+
