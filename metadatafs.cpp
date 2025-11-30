@@ -44,13 +44,8 @@ static void update_fnv1a(uint64_t &hash, const char* buf, size_t size) {
 }
 
 // Store/overwrite checksum(path) in the checksums table
-static int store_checksum(const char* path, uint64_t hash) {
+static int store_checksum(const char* path, std::string checksum) {
     if (!meta_db) return -EIO;
-
-    // convert hash to hex string
-    std::ostringstream oss;
-    oss << std::hex << hash;
-    std::string checksum = oss.str();
 
     const char* sql =
         "INSERT INTO checksums(path, checksum) "
@@ -450,8 +445,10 @@ static int fs_release(const char* path, struct fuse_file_info* fi) {
     // If we tracked a checksum for this fd, finalize & store it
     auto it = checksum_map.find(fd);
     if (it != checksum_map.end()) {
-        uint64_t hash = it->second;
         checksum_map.erase(it);
+
+        std::string real = full_path(path);
+        std::string hash = compute_checksum_for_file(real);
 
         int rc = store_checksum(path, hash);
         if (rc != 0) {
