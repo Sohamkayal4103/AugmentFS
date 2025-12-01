@@ -5,4 +5,5 @@ mount_point/
 .vscode/
 .DS_Store
 Thumbs.db
+backing_dir/
 *~

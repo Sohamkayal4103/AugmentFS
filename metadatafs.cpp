@@ -31,6 +31,7 @@ static const uint64_t FNV_PRIME        = 1099511628211ULL;
 static std::unordered_set<int> verified_ok_fds;    // fds whose checksum matched
 static std::unordered_set<int> verified_bad_fds;   // fds with checksum mismatch
 static std::vector<std::string> append_only_dirs;  // e.g., "/logs", "/backups"
+static std::unordered_multimap<std::string, int> open_path_to_fd;
 
 static bool is_append_only_path(const char* path);
 
@@ -359,11 +360,30 @@ static int fs_readdir(const char* path, void* buf, fuse_fill_dir_t filler,
     return 0;
 }
 
+
+static uint64_t compute_hash_uint64(const std::string& real_path) {
+    int fd = open(real_path.c_str(), O_RDONLY);
+    if (fd == -1) {
+        // If file can't be opened, return default empty hash
+        return FNV_OFFSET_BASIS;
+    }
+
+    uint64_t hash = FNV_OFFSET_BASIS;
+    char buf[4096];
+    ssize_t n;
+
+    while ((n = read(fd, buf, sizeof(buf))) > 0) {
+        update_fnv1a(hash, buf, (size_t)n);
+    }
+
+    close(fd);
+    return hash;
+}
+
 /*
  * fs_open: open a file in the backing directory
  */
 static int fs_open(const char* path, struct fuse_file_info* fi) {
-    // Block O_TRUNC on append-only paths
     if (is_append_only_path(path) && (fi->flags & O_TRUNC)) {
         std::cout << "fs_open: DENY O_TRUNC (append-only) " << path << std::endl;
         return -EPERM;
@@ -372,24 +392,38 @@ static int fs_open(const char* path, struct fuse_file_info* fi) {
     std::string real = full_path(path);
     std::cout << "fs_open: " << path << " -> " << real << std::endl;
 
+    // Open the real file (letting OS handle Truncate/Append flags)
     int fd = open(real.c_str(), fi->flags);
     if (fd == -1) {
         return -errno;
     }
 
-    fi->fh = fd;    // store OS file descriptor in FUSE's file handle
+    fi->fh = fd; 
 
-    // Clear any stale read verification state for this fd
+    // Clear verification cache since we are opening it fresh
     verified_ok_fds.erase(fd);
     verified_bad_fds.erase(fd);
 
-    // Determine access mode
     int accmode = fi->flags & O_ACCMODE;
     bool is_writer = (accmode == O_WRONLY || accmode == O_RDWR);
 
     if (is_writer) {
-        checksum_map[fd] = FNV_OFFSET_BASIS;  // initialize running hash
+        if (fi->flags & O_TRUNC) {
+            // Case A: Overwrite. The file is now empty (0 bytes).
+            // Start the hash from scratch.
+            checksum_map[fd] = FNV_OFFSET_BASIS;
+        } else {
+            // Case B: Append or Modify. The file retains existing data.
+            // We must start our math with the hash of the EXISTING content!
+            // We use our helper function to compute the hash of what's currently on disk.
+            checksum_map[fd] = compute_hash_uint64(real);
+            
+            std::cout << "fs_open: Pre-loaded existing hash for append/modify mode." << std::endl;
+        }
     }
+
+
+    open_path_to_fd.insert({std::string(path), fd});
 
     return 0;
 }
@@ -443,6 +477,15 @@ static int fs_write(const char* path, const char* buf, size_t size,
  */
 static int fs_release(const char* path, struct fuse_file_info* fi) {
     int fd = static_cast<int>(fi->fh);
+
+    auto range = open_path_to_fd.equal_range(path);
+    for (auto it = range.first; it != range.second; ) {
+        if (it->second == fd) {
+            it = open_path_to_fd.erase(it);
+        } else {
+            ++it;
+        }
+    }
 
     // Close underlying file
     int res = (close(fd) == -1) ? -errno : 0;
@@ -508,6 +551,15 @@ static bool is_append_only_path(const char* path) {
     return false;
 }
 
+static int fs_utimens(const char* path, const struct timespec tv[2]) {
+    std::string real = full_path(path);
+    // utimensat with 0 flags updates the time on the real underlying file
+    if (utimensat(0, real.c_str(), tv, 0) == -1) {
+        return -errno;
+    }
+    return 0;
+}
+
 /*
  * fs_unlink: delete a file
  */
@@ -557,6 +609,26 @@ static int fs_truncate(const char* path, off_t size) {
 
     if (truncate(real.c_str(), size) == -1) {
         return -errno;
+    }
+
+    // 1. Calculate the NEW hash of the file on disk (handles size=0 or size=N)
+    uint64_t new_hash = compute_hash_uint64(real);
+    
+    // 2. Update the Database
+    store_checksum(path, new_hash);
+
+    // 3. Update any OPEN file descriptors
+    auto range = open_path_to_fd.equal_range(path);
+    for (auto it = range.first; it != range.second; ++it) {
+        int fd = it->second;
+        
+        // CRITICAL CHECK: Only update if this FD is actually a WRITER.
+        // If we don't check this, we might accidentally add a read-only FD 
+        // to the checksum_map, breaking future reads.
+        if (checksum_map.count(fd)) {
+            checksum_map[fd] = new_hash; 
+            std::cout << "fs_truncate: Updated running hash for FD " << fd << std::endl;
+        }
     }
     return 0;
 }
@@ -808,6 +880,8 @@ void set_fs_ops() {
 
     fs_ops.mkdir    = fs_mkdir;
     fs_ops.rmdir    = fs_rmdir;
+
+    fs_ops.utimens  = fs_utimens;
 }
 
 int main(int argc, char* argv[]) {
