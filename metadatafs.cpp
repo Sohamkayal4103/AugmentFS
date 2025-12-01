@@ -416,9 +416,21 @@ static int fs_read(const char* path, char* buf, size_t size,
  */
 static int fs_write(const char* path, const char* buf, size_t size,
                     off_t offset, struct fuse_file_info* fi) {
-    (void) path;
-
     int fd = static_cast<int>(fi->fh);
+
+    if (is_append_only_path(path)) {
+        off_t end = lseek(fd, 0, SEEK_END);
+        if (end == (off_t)-1) {
+            return -errno;
+        }
+
+        if (offset != end) {
+            std::cout << "fs_write: DENY non-EOF write on append-only path "
+                      << path << " (offset=" << offset
+                      << ", end=" << end << ")\n";
+            return -EPERM;
+        }
+    }
 
     // Update checksum if this fd is tracked
     auto it = checksum_map.find(fd);
