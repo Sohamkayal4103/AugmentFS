@@ -23,6 +23,8 @@ This initial version of a custom filesystem. It successfully:
   
 - libfuse-dev (or fuse on some systems)
 
+- libsqlite3-dev
+
 - pkg-config
 
 ## How to Build
@@ -30,7 +32,7 @@ This initial version of a custom filesystem. It successfully:
 - First, ensure you have the necessary libraries installed:
 ```
 sudo apt update
-sudo apt install g++ make pkg-config libfuse-dev
+sudo apt install g++ make pkg-config libfuse-dev libsqlite3-dev
 ```
 
 - Then, compile the program by running make:
