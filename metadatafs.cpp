@@ -392,15 +392,11 @@ static int fs_open(const char* path, struct fuse_file_info* fi) {
     std::string real = full_path(path);
     std::cout << "fs_open: " << path << " -> " << real << std::endl;
 
-    // Open the real file (letting OS handle Truncate/Append flags)
+    // 1. Open the real file
     int fd = open(real.c_str(), fi->flags);
-    if (fd == -1) {
-        return -errno;
-    }
+    if (fd == -1) return -errno;
 
     fi->fh = fd; 
-
-    // Clear verification cache since we are opening it fresh
     verified_ok_fds.erase(fd);
     verified_bad_fds.erase(fd);
 
@@ -409,22 +405,53 @@ static int fs_open(const char* path, struct fuse_file_info* fi) {
 
     if (is_writer) {
         if (fi->flags & O_TRUNC) {
-            // Case A: Overwrite. The file is now empty (0 bytes).
-            // Start the hash from scratch.
+            // Overwrite: Old data irrelevant. Start fresh.
             checksum_map[fd] = FNV_OFFSET_BASIS;
         } else {
-            // Case B: Append or Modify. The file retains existing data.
-            // We must start our math with the hash of the EXISTING content!
-            // We use our helper function to compute the hash of what's currently on disk.
-            checksum_map[fd] = compute_hash_uint64(real);
+            // STRICT APPEND LOGIC
             
-            std::cout << "fs_open: Pre-loaded existing hash for append/modify mode." << std::endl;
+            // 1. Compute hash of what is currently on disk
+            uint64_t disk_hash_val = compute_hash_uint64(real);
+            
+            // 2. Fetch what the DB thinks the hash should be
+            if (meta_db) {
+                const char* sql = "SELECT checksum FROM checksums WHERE path = ?;";
+                sqlite3_stmt* stmt = nullptr;
+                if (sqlite3_prepare_v2(meta_db, sql, -1, &stmt, nullptr) == SQLITE_OK) {
+                    sqlite3_bind_text(stmt, 1, path, -1, SQLITE_TRANSIENT);
+                    
+                    int rc = sqlite3_step(stmt);
+                    if (rc == SQLITE_ROW) {
+                        const unsigned char* txt = sqlite3_column_text(stmt, 0);
+                        std::string db_hash = txt ? reinterpret_cast<const char*>(txt) : "";
+                        
+                        // Convert our disk calculation to string for comparison
+                        std::ostringstream oss;
+                        oss << std::hex << disk_hash_val;
+                        std::string disk_hash_str = oss.str();
+
+                        // 3. STRICT CHECK
+                        if (!db_hash.empty() && db_hash != disk_hash_str) {
+                            std::cerr << "fs_open: STRICT INTEGRITY CHECK FAILED on Append!" << std::endl;
+                            std::cerr << "   DB Says:   " << db_hash << std::endl;
+                            std::cerr << "   Disk Says: " << disk_hash_str << std::endl;
+                            
+                            sqlite3_finalize(stmt);
+                            close(fd); // Close the file we just opened
+                            return -EIO; // BLOCK THE OPEN
+                        }
+                    }
+                    sqlite3_finalize(stmt);
+                }
+            }
+
+            // Check passed (or DB was empty). Load the hash and proceed.
+            checksum_map[fd] = disk_hash_val;
+            std::cout << "fs_open: Integrity verified. Pre-loaded hash for append." << std::endl;
         }
     }
 
-
     open_path_to_fd.insert({std::string(path), fd});
-
     return 0;
 }
 
